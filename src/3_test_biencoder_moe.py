@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import ipdb
 
 import hydra
 import torch
@@ -88,7 +87,8 @@ def get_bert_rerank(data, model, doc_embedding, bm25_runs, id_to_index):
     model.eval()
     for d in tqdm.tqdm(data, total=len(data)):
         with torch.no_grad():
-            q_embedding = model.query_encoder([d['text']])
+            with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                q_embedding, _ = model.query_encoder([d['text']])
             
         bm25_docs = list(bm25_runs[d['_id']].keys())
         d_embeddings = doc_embedding[torch.tensor([int(id_to_index[x]) for x in bm25_docs])]
@@ -104,8 +104,8 @@ def get_full_bert_rank(data, model, doc_embedding, id_to_index, k=1000):
     model.eval()
     for d in tqdm.tqdm(data, total=len(data)):
         with torch.no_grad():
-            # with torch.autocast(device_type=model.device):
-            q_embedding = model.query_encoder([d['text']])
+            with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                q_embedding, _ = model.query_encoder([d['text']])
         
         bert_scores = torch.einsum('xy, ly -> x', doc_embedding, q_embedding)
         index_sorted = torch.argsort(bert_scores, descending=True)
@@ -151,6 +151,8 @@ def main(cfg: DictConfig):
         specialized_mode=cfg.model.init.specialized_mode,
         pooling_mode=cfg.model.init.aggregation_mode,
         use_adapters = cfg.model.adapters.use_adapters,
+        latent_size=cfg.model.adapters.get('latent_size'),
+        non_linearity=cfg.model.adapters.get('non_linearity', 'relu'),
         device=cfg.model.init.device
     )
     
@@ -159,8 +161,8 @@ def main(cfg: DictConfig):
             model.load_state_dict(torch.load(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_top1.pt', weights_only=True))
             print(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_top1.pt')
         elif cfg.model.init.specialized_mode == "sbmoe_all":
-            model.load_state_dict(torch.load(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_top1.pt', weights_only=True))
-            print(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_top1.pt')
+            model.load_state_dict(torch.load(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_all.pt', weights_only=True))
+            print(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_all.pt')
         elif cfg.model.init.specialized_mode == "random":
             model.load_state_dict(torch.load(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-random.pt', weights_only=True))
             print(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-random.pt')
@@ -236,7 +238,9 @@ def main(cfg: DictConfig):
     # query
     model.eval()
     with torch.no_grad():
-        query_embedding = model.query_encoder([random_query['text']]).to(cfg.model.init.device)
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+            query_embedding, _ = model.query_encoder([random_query['text']])
+        query_embedding = query_embedding.to(cfg.model.init.device)
 
     # Get top 1000 docs
     topk_ids = list(bert_run[query_id].keys())[:1000]

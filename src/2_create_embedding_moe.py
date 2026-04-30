@@ -53,6 +53,8 @@ def main(cfg: DictConfig):
         specialized_mode=cfg.model.init.specialized_mode,
         pooling_mode=cfg.model.init.aggregation_mode,
         use_adapters = cfg.model.adapters.use_adapters,
+        latent_size=cfg.model.adapters.get('latent_size'),
+        non_linearity=cfg.model.adapters.get('non_linearity', 'relu'),
         device=cfg.model.init.device
     )
     if cfg.model.adapters.use_adapters:
@@ -61,8 +63,8 @@ def main(cfg: DictConfig):
             print(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_top1.pt')
             # model.load_state_dict(torch.load(f'output/msmarco/saved_models/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_top1.pt', weights_only=True))
         elif cfg.model.init.specialized_mode == "sbmoe_all":
-            model.load_state_dict(torch.load(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_top1.pt', weights_only=True))
-            print(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_top1.pt')
+            model.load_state_dict(torch.load(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_all.pt', weights_only=True))
+            print(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_all.pt')
             # model.load_state_dict(torch.load(f'output/msmarco/saved_models/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-sbmoe_top1.pt', weights_only=True))   
         elif cfg.model.init.specialized_mode == "random":
             model.load_state_dict(torch.load(f'{cfg.dataset.model_dir}/{cfg.model.init.save_model}_experts{cfg.model.adapters.num_experts}-random.pt', weights_only=True))
@@ -100,13 +102,12 @@ def main(cfg: DictConfig):
         texts.append(doc.get('title','').lower() + ' ' + doc['text'].lower())
         if len(texts) == cfg.training.batch_size:
             with torch.no_grad():
-                #with torch.autocast(device_type=cfg.model.init.device):
-                batch_doc_embs = model.doc_encoder(texts)
+                with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                    batch_doc_embs, _ = model.doc_encoder(texts)
                 embedding_matrix[index - len(texts) : index] = batch_doc_embs.cpu()
-                # embedding_matrix[index - len(texts) : index] = model.doc_encoder(texts).cpu()
 
                 # ---- Track expert usage per doc (sbmoe_all) ----
-                expert_probs = model.cls(batch_doc_embs)  # [B, num_experts]
+                expert_probs, _ = model._gate_forward(batch_doc_embs)  # Use refactored gate
                 top_experts = torch.argmax(expert_probs, dim=1).cpu()  # [B]
                 all_expert_ids.extend(top_experts.tolist())
                 all_doc_embeddings.append(batch_doc_embs.cpu())
@@ -114,11 +115,11 @@ def main(cfg: DictConfig):
             texts = []
     if texts:
         with torch.no_grad():
-            # with torch.autocast(device_type=cfg.model.init.device):
-            batch_doc_embs = model.doc_encoder(texts)
+            with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                batch_doc_embs, _ = model.doc_encoder(texts)
             embedding_matrix[index - len(texts) : index] = batch_doc_embs.cpu()
 
-            expert_probs = model.cls(batch_doc_embs)
+            expert_probs, _ = model._gate_forward(batch_doc_embs)
             top_experts = torch.argmax(expert_probs, dim=1).cpu()
             all_expert_ids.extend(top_experts.tolist())
             all_doc_embeddings.append(batch_doc_embs.cpu())

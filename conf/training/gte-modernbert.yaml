@@ -1,0 +1,4 @@
+lr: 2e-5
+batch_size: 128
+max_epoch: 5
+warmup_steps: 200

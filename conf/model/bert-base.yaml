@@ -12,9 +12,10 @@ init:
 adapters:
   num_experts: 6
   residual: True
-  latent_size: 192
+  latent_size: 384
   non_linearity: 'relu'
   use_adapters: True
+  aux_loss_coeff: 0.01
 
 continue_train: False
   

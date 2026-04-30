@@ -9,16 +9,17 @@ import tqdm
 from omegaconf import DictConfig
 from torch import save, load
 from torch.optim import AdamW
-from transformers import AutoModel, AutoTokenizer, AutoConfig
+from transformers import AutoModel, AutoTokenizer, AutoConfig, get_linear_schedule_with_warmup
 
 from dataloader.dataloader import LoadTrainNQData
 from model.loss import MultipleRankingLossBiEncoder
 from model.models import MoEBiEncoder
 from model.utils import seed_everything
+from torch.cuda.amp import autocast
 
 logger = logging.getLogger(__name__)
 
-def train(train_data, model, optimizer, loss_fn, batch_size, epoch, device):
+def train(train_data, model, optimizer, scheduler, loss_fn, batch_size, epoch, device):
     """
     Training function
 
@@ -45,15 +46,21 @@ def train(train_data, model, optimizer, loss_fn, batch_size, epoch, device):
     optimizer.zero_grad()
     sim_accuracy = []
     for _, batch in enumerate(train_data):
-        # with torch.autocast(device_type=device):
-        output = model((batch['question'], batch['pos_text']))
-        loss_val, sim_correct = loss_fn(
-            output[0], output[1]
-        )
+        with autocast(enabled=True, dtype=torch.bfloat16):
+            output = model((batch['question'], batch['pos_text']))
+            if len(output) == 3:
+                q_emb, p_emb, aux_loss = output
+                loss_val, sim_correct = loss_fn(q_emb, p_emb)
+                loss_val = loss_val + aux_loss
+            else:
+                q_emb, p_emb = output
+                loss_val, sim_correct = loss_fn(q_emb, p_emb)
+                
         sim_accuracy.extend(sim_correct.tolist())
 
         loss_val.backward()
         optimizer.step()
+        scheduler.step()
         optimizer.zero_grad()
 
         losses.append(loss_val.cpu().detach().item())
@@ -92,12 +99,12 @@ def validate(val_data, model, loss_fn, batch_size, epoch, device):
     val_data = tqdm.tqdm(data)
     for _, batch in enumerate(val_data):
         with torch.no_grad():
-            # with torch.autocast(device_type=device):
-            output = model.val_forward((batch['question'], batch['pos_text']))
-            loss_val, sim_correct = loss_fn.val_forward(
-                output[0], output[1]
-            )
-            sim_accuracy.extend(sim_correct.tolist())
+            with autocast(enabled=True, dtype=torch.bfloat16):
+                output = model.val_forward((batch['question'], batch['pos_text']))
+                loss_val, sim_correct = loss_fn.val_forward(
+                    output[0], output[1]
+                )
+                sim_accuracy.extend(sim_correct.tolist())
 
         losses.append(loss_val.cpu().detach().item())
         average_loss = np.mean(losses)
@@ -171,6 +178,9 @@ def main(cfg: DictConfig) -> None:
         specialized_mode=cfg.model.init.specialized_mode,
         pooling_mode=cfg.model.init.aggregation_mode,
         use_adapters = cfg.model.adapters.use_adapters,
+        latent_size=cfg.model.adapters.get('latent_size'),
+        non_linearity=cfg.model.adapters.get('non_linearity', 'relu'),
+        aux_loss_coeff=cfg.model.adapters.get('aux_loss_coeff', 0.0),
         device=cfg.model.init.device
     )
     logging.info("Model: {}, lr: {:.2e}, batch_size: {}, epochs: {}".format(cfg.model.init.doc_model, cfg.training.lr, cfg.training.batch_size, cfg.training.max_epoch))
@@ -204,13 +214,25 @@ def main(cfg: DictConfig) -> None:
         {
             'params': model.cls_3.parameters(),
             'lr': cfg.training.lr
+        },
+        {
+            'params': model.noise_linear.parameters(),
+            'lr': cfg.training.lr
         }
     ]
+    )
+
+    num_training_steps = (len(train_data) // cfg.training.batch_size) * cfg.training.max_epoch
+    warmup_steps = cfg.training.get('warmup_steps', 0)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=warmup_steps, 
+        num_training_steps=num_training_steps
     )
     
     for epoch in tqdm.tqdm(range(max_epoch)):
         model.train()
-        average_loss = train(train_data, model, optimizer, loss_fn, batch_size, epoch + 1, cfg.model.init.device)
+        average_loss = train(train_data, model, optimizer, scheduler, loss_fn, batch_size, epoch + 1, cfg.model.init.device)
         logging.info("TRAIN EPOCH: {:3d}, Average Loss: {:.5e}".format(epoch + 1, average_loss))
         
         model.eval()
